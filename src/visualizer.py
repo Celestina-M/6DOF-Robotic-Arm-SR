@@ -42,17 +42,24 @@ class Visualizer:
     def draw_arm(self, joint_angles=None):
         """
         绘制机械臂 (支持首次绘制和后续高速更新)
-            - joint_angles: 可选参数，直接传入关节角度数组（如果不传则使用当前机械臂状态）
-            TODO: 绘制机械臂的连杆和关节
         """    
         if joint_angles is not None:
             self.arm.set_joint_angles(joint_angles)
 
-        joint_positions = np.array(self.arm.forward_kinematics())
+        # 1. 获取所有关节的 4x4 变换矩阵
+        transforms = self.arm.get_all_joint_transforms(joint_angles)
+
+        # 2. 提取并组装坐标点列表 (加上原点)
+        positions = [[0.0, 0.0, 0.0]]  # 将基座钉在原点
+        for T in transforms:
+            # T[:3, 3] 提取的是矩阵前三行第四列，即真正的 [px, py, pz]
+            positions.append(T[:3, 3]) 
+            
+        # 转换为 NumPy 数组方便切片，此时 shape 为 (7, 3)，代表 1个基座 + 6个关节
+        joint_positions = np.array(positions)
 
         # 如果是第一帧，画出实线；如果不是，只更新坐标数据
         if self.arm_line is None:
-            # 改进视觉效果：调整配色和粗细
             self.arm_line, = self.ax.plot(
                 joint_positions[:, 0], joint_positions[:, 1], joint_positions[:, 2], 
                 color='#2C3E50', marker='o', markerfacecolor='#E74C3C', 
@@ -68,7 +75,7 @@ class Visualizer:
             )
             self.ax.legend()
         else:
-            # 高性能更新模式（不闪烁，不卡顿）
+            # 高性能更新模式
             self.arm_line.set_data_3d(joint_positions[:, 0], joint_positions[:, 1], joint_positions[:, 2])
             self.base_point.set_data_3d([joint_positions[0, 0]], [joint_positions[0, 1]], [joint_positions[0, 2]])
             self.end_point.set_data_3d([joint_positions[-1, 0]], [joint_positions[-1, 1]], [joint_positions[-1, 2]])

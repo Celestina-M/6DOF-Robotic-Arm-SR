@@ -2,8 +2,22 @@
 机械臂动力学模块
 """
 import numpy as np
+from numba import njit
 from scipy.integrate import odeint
 from robotic_arm_new import RoboticArm
+
+
+@njit
+def fast_christoffel_computation(num_joints, dM_dq_arr, q_dot):
+
+    C = np.zeros((num_joints, num_joints))
+    for i in range(num_joints):
+        for j in range(num_joints):
+            for k in range(num_joints):
+                # 查表直接获取偏导数
+                c_ijk = 0.5 * (dM_dq_arr[k, i, j] + dM_dq_arr[j, i, k] - dM_dq_arr[i, j, k])
+                C[i, j] += c_ijk * q_dot[k]
+    return C
 
 class RoboticArmDynamics(RoboticArm):
     def __init__(self, num_joints=6):
@@ -34,7 +48,7 @@ class RoboticArmDynamics(RoboticArm):
         self.gravity = np.array([0, 0, -9.81])
 
         # 关节摩擦系数 
-        self.friction_coeffs = np.array([0.1, 0.1, 0.1, 0.05, 0.05, 0.05])
+        self.friction_coeffs = np.array([5.0, 5.0, 5.0, 2.0, 2.0, 2.0])
 
     def mass_matrix(self, q):
         """计算质量矩阵 M(q)
@@ -54,7 +68,7 @@ class RoboticArmDynamics(RoboticArm):
             # 获取第 k 个连杆的雅可比矩阵 (3 x num_joints)
             # 注意：是连杆 k，计算它受所有前面关节的影响
             J_vk = self._velocity_jacobian(q, k)
-            J_wk = self.angular_velocity_jacobian(q, k)
+            J_wk = self._angular_velocity_jacobian(q, k)
 
             # 矩阵乘法直接累加贡献： J_v.T * J_v 是 (6x3) @ (3x6) = (6x6) 的矩阵
             M += m_k * (J_vk.T @ J_vk) + (J_wk.T @ I_k @ J_wk)
@@ -86,14 +100,18 @@ class RoboticArmDynamics(RoboticArm):
             # 数值求导得到偏导数矩阵 ∂M/∂q_k
             dM_dq_k = (M_plus - M_minus) / (2 * epsilon)
             dM_dq.append(dM_dq_k)
-
+        
+        # 把 Python 列表转换成形状为 (6, 6, 6) 的 3D Numpy 数组
+        dM_dq_arr = np.array(dM_dq)
+        
+        C = fast_christoffel_computation(self.num_joints, dM_dq_arr, q_dot)
         # 2. 根据克里斯托菲尔符号组装科氏力矩阵
-        for i in range(self.num_joints):
-            for j in range(self.num_joints):
-                for k in range(self.num_joints):
+        #for i in range(self.num_joints):
+            #for j in range(self.num_joints):
+                #for k in range(self.num_joints):
                     # 查表直接获取偏导数，公式：c_ijk = 0.5 * ( ∂M_ij/∂q_k + ∂M_ik/∂q_j - ∂M_jk/∂q_i )
-                    c_ijk = 0.5 * (dM_dq[k][i, j] + dM_dq[j][i, k] - dM_dq[i][j, k])
-                    C[i, j] += c_ijk * q_dot[k]
+                    #c_ijk = 0.5 * (dM_dq[k][i, j] + dM_dq[j][i, k] - dM_dq[i][j, k])
+                    #C[i, j] += c_ijk * q_dot[k]
 
         return C
         
@@ -209,10 +227,10 @@ class RoboticArmDynamics(RoboticArm):
         t = np.arange(t_span[0], t_span[1], dt)
 
         #数值积分
-        states = odeint(dynamics, state0, t)
+        states = odeint(dynamics, state0, t, mxstep=5000)
 
         q = states[:, :self.num_joints]
-        q_dot = states[:, self.num_joints]
+        q_dot = states[:, self.num_joints:]
 
         return t, q, q_dot
 
@@ -258,55 +276,34 @@ class RoboticArmDynamics(RoboticArm):
         # 变换矩阵的第 4 列的前 3 个元素，就是该连杆在世界坐标系下的位置 [x, y, z]
         return T_i[0:3, 3]
     
-#测试代码
-if __name__ == "__main__":
-    #创建动力学模型
-    arm = RoboticArmDynamics(num_joints=6)
-
-    #测试1:重力补偿
-    print("测试1：重力补偿")
-    q = np.array([0, np.pi/4, -np.pi/4, 0, 0, 0])
-    G = arm.gravity_vector(q)
-    print(f"重力力矩：{G}")
-
-    #测试2：自由落体仿真
-    print("\n测试2：自由落体仿真")
-    q0 = np.array([0, np.pi/4, 0, 0, 0])
-    q_dot0 = np.zero(6)
-
-    def zero_torque(t, q, q_dot):
-        return np.zeros(6)
-    
-    t, q_hist, q_dot_hist = arm.simulate(
-        q0, q_dot0, zero_torque, [0, 2.0], dt=0.01
-    )            
-    print(f"仿真时间：{len(t)}个时间步")
-    print(f"最终角度：{q_hist[-1]}")
 
 
 class PIDController:
-    def __init__(self, Kp, Ki, Kd, num_joints=6):
+    def __init__(self, Kp, Ki, Kd, num_joints=6, integral_limit=30.0, error_threshold=0.1):
         """PID控制器初始化
         参数:
             Kp: 比例增益
             Ki: 积分增益
             Kd: 微分增益
+            integral_limit: 积分项限幅的最大绝对值 (积分限幅 Anti-Windup)
+            error_threshold: 启动积分的误差阈值 (积分分离)
         """
         self.Kp = np.array(Kp)
         self.Ki = np.array(Ki)
         self.Kd = np.array(Kd)
+        
+        self.integral_limit = integral_limit
+        self.error_threshold = error_threshold
 
         # 积分项累计
         self.integral = np.zeros(num_joints)
-
-        # 上一次误差，用于计算微分项
+        # 上一次误差
         self.prev_error = np.zeros(num_joints)
-
-        #时间步长
+        # 时间步长
         self.dt = 0.01
 
-    def compute_control(self, q_desired, q_actual, q_dot_actual):
-        """计算控制力矩
+    def compute_control(self, q_desired, q_actual, q_dot_actual, q_dot_desired=None):
+        """计算闭环控制力矩       
         参数:
             q_desired: 期望关节角度列表
             q_current: 当前关节角度列表
@@ -315,83 +312,42 @@ class PIDController:
             返回:
             tau: 控制力矩列表
         """
-        #位置误差
+        # 如果没有提供期望速度（定点控制），则默认为 0
+        if q_dot_desired is None:
+            q_dot_desired = np.zeros_like(q_actual)
+
+        # 1. 位置误差
         error = q_desired - q_actual
 
-        #积分项
-        self.integral += error * self.dt
+        # 2. 积分计算 (积分分离逻辑)
+        for i in range(len(error)):
+            if abs(error[i]) < self.error_threshold:
+                self.integral[i] += error[i] * self.dt
+            else:
+                # 误差较大时，积分项保持不变（也可以选择清零 self.integral[i] = 0）
+                pass 
 
-        #微分项（使用速度反馈）
-        derivative = -q_dot_actual
+        # 3. 积分限幅 (强行截断，防止无限膨胀)
+        self.integral = np.clip(self.integral, -self.integral_limit, self.integral_limit)
 
-        #PID控制律
-        tau = (self.Kp * error + 
-               self.Ki * self.integral + 
-               self.Kd * derivative)
+        # 4. 微分项（速度误差）
+        error_dot = q_dot_desired - q_dot_actual
+
+        # 5. PID控制律计算
+        tau_feedback = (self.Kp * error + 
+                        self.Ki * self.integral + 
+                        self.Kd * error_dot)
         
-        #更新上一次误差
         self.prev_error = error
 
-        return tau
+        return tau_feedback
+
     def reset(self):
-        """重置积分项和误差"""
+        """重置积分项和误差（在每次开启新的仿真或运动前调用）"""
         self.integral = np.zeros_like(self.integral)
         self.prev_error = np.zeros_like(self.prev_error)
+
     
-#测试代码
-def test_pid_controller():
-    """测试PID控制器"""
-    arm = RoboticArmDynamics(num_joints=6)
-
-    #PID参数
-    Kp = [50, 50, 50, 20, 20, 20]
-    Ki = [0, 0, 0, 0, 0, 0]
-    Kd = [10, 10, 10, 5, 5, 5]
-
-    controller = PIDController(Kp, Ki, Kd)
-
-    #目标位置
-    q_target = np.array([0.5, 0.5, -0.5, 0, 0.5, 0])
-
-    #初始状态
-    q0 = np.array([0.1, 0.1, -0.1, 0.1, 0.1, 0.1])
-    q_dot0 = np.zeros(6)
-
-    #控制函数
-    def control_torque(q, q_dot, t):
-        return controller.compute_control(q_target, q, q_dot)
-    
-    #仿真
-    t, q_hist, q_dot_hist = arm.simulate(
-        q0, q_dot0, control_torque, [0, 2.0], dt=0.01
-    )
-
-    #绘制结果
-    import matplotlib.pyplot as plt
-
-    plt.figure(figsize=(12, 8))
-
-    for i in range(6):
-        plt.subplot(3, 2, i+1)
-        plt.plot(t, q_hist[:, i], label=f'Joint {i+1}')
-        plt.axhline(q_target[i], color='r', linestyle='--', label='Target')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Angle (rad)')
-        plt.title(f'Joint {i+1} Angle')
-        plt.legend()
-        plt.grid(True)
-
-    plt.tight_layout()
-    plt.show()
-
-    #计算稳态误差
-    final_error = np.abs(q_hist[-1] - q_target)
-    print(f"最终误差：{final_error}")
-    print(f"最大误差：{np.max(final_error):.4f} rad")
-
-if __name__ == "__main__":
-    test_pid_controller()
-
 
 class ComputedTorqueController:
     def __init__(self, robotic_dynamics, Kp, Kd):
@@ -430,39 +386,113 @@ class ComputedTorqueController:
 
         return tau
 
-class GravityCompensationController:
-    def __init__(self, robotic_dynamics, kp, kd):
-        """重力补偿控制器初始化
+class GravityCompensationPIDController:
+    def __init__(self, robotic_dynamics, pid_controller):
+        """前馈+反馈组合控制器初始化
         参数:
-            robotic_dynamics: 机械臂动力学模型实例
-            kp: 比例增益
-            kd: 微分增益
+            robotic_dynamics: 机械臂动力学模型实例 (用于计算 G)
+            pid_controller: 包含完整PID逻辑的控制器实例
         """
         self.arm = robotic_dynamics
-        self.kp = np.array(kp)
-        self.kd = np.array(kd)
+        self.pid = pid_controller
 
-    def compute(self, q_desired, q_actual, q_dot_actual):
-        """计算重力补偿力矩
-        参数:
-            q_desired: 期望关节角度列表
-            q_actual: 当前关节角度列表
-            q_dot_actual: 当前关节速度列表
-            返回:
-            tau: 重力补偿力矩列表
+    def compute_control(self, q_desired, q_actual, q_dot_actual, q_dot_desired=None):
+        """计算总控制力矩
+        公式：tau = G(q) + PID_output
         """
-        #位置误差和速度误差
-        error = q_desired - q_actual
-        error_dot = -q_dot_actual
+        # 1. 前馈：计算当前姿态下的重力补偿力矩
+        tau_gravity = self.arm.gravity_vector(q_actual)
 
+        # 2. 反馈：计算 PID 闭环补偿力矩
+        tau_pid = self.pid.compute_control(q_desired, q_actual, q_dot_actual, q_dot_desired)
 
-        #重力补偿
-        G = self.arm.gravity_vector(q_actual)
+        # 3. 总控制力矩
+        tau_total = tau_gravity + tau_pid
+        
+        return tau_total
 
-        #PD控制 + 重力补偿
-        tau = G + self.kp * error + self.kd * error_dot
-        return tau
+#测试代码
+def test_freefall():
+    #创建动力学模型
+    arm = RoboticArmDynamics(num_joints=6)
+
+    #测试1:重力补偿
+    print("测试1：重力补偿")
+    q = np.array([0, np.pi/4, -np.pi/4, 0, 0, 0])
+    G = arm.gravity_vector(q)
+    print(f"重力力矩：{G}")
+
+    #测试2：自由落体仿真
+    print("\n测试2：自由落体仿真")
+    q0 = np.array([0, np.pi/4, 0, 0, 0, 0])
+    q_dot0 = np.zeros(6)
+
+    def zero_torque(t, q, q_dot):
+        return np.zeros(6)
     
+    t, q_hist, q_dot_hist = arm.simulate(
+        q0, q_dot0, zero_torque, [0, 2.0], dt=0.01
+    )            
+    print(f"仿真时间：{len(t)}个时间步")
+    print(f"最终角度：{q_hist[-1]}")
+
+def test_pid_controller():
+    """测试重力补偿 + PID闭环控制器"""
+    arm = RoboticArmDynamics(num_joints=6)
+
+    # PID参数 
+    Kp = [150, 150, 150, 50, 50, 50]
+    Ki = [50, 50, 50, 20, 20, 20]    
+    Kd = [15, 15, 15, 5, 5, 5]
+
+    # 1. 初始化带有抗积分饱和的PID
+    pure_pid = PIDController(Kp, Ki, Kd, integral_limit=30.0, error_threshold=0.1)
+    
+    # 2. 将纯PID包装进重力补偿控制器中
+    controller = GravityCompensationPIDController(arm, pure_pid)
+
+    # 目标位置
+    q_target = np.array([0.5, 0.5, -0.5, 0, 0.5, 0])
+
+    # 初始状态
+    q0 = np.array([0.1, 0.1, -0.1, 0.1, 0.1, 0.1])
+    q_dot0 = np.zeros(6)
+
+    # 控制函数
+    def control_torque(q, q_dot, t):
+        # 使用组合控制器输出力矩
+        return controller.compute_control(q_target, q, q_dot)
+    
+    pure_pid.reset()
+
+    # 仿真
+    print("重力补偿+PID闭环仿真计算中...")
+    t, q_hist, q_dot_hist = arm.simulate(
+        q0, q_dot0, control_torque, [0, 2.0], dt=0.01
+    )
+
+    # 绘制结果
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 8))
+    for i in range(6):
+        plt.subplot(3, 2, i+1)
+        plt.plot(t, q_hist[:, i], label=f'Joint {i+1}')
+        plt.axhline(q_target[i], color='r', linestyle='--', label='Target')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Angle (rad)')
+        plt.title(f'Joint {i+1} Angle')
+        plt.legend()
+        plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # 计算稳态误差
+    final_error = np.abs(q_hist[-1] - q_target)
+    print(f"最终误差：{final_error}")
+    print(f"最大误差：{np.max(final_error):.6f} rad")
+
+
+
 #测试代码
 def compare_controllers():
     """比较计算力矩控制器和重力补偿控制器"""
@@ -527,4 +557,11 @@ def compare_controllers():
     plt.show()
 
 if __name__ == "__main__":
+    print("========== 运行自由落体测试 ==========")
+    test_freefall()
+    
+    print("\n========== 运行重力补偿+PID测试 ==========")
+    test_pid_controller()
+    
+    print("\n========== 运行计算力矩控制器测试 ==========")
     compare_controllers()
