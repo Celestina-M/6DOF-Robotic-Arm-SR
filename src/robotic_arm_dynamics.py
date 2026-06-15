@@ -3,7 +3,8 @@
 """
 import numpy as np
 from numba import njit
-from scipy.integrate import odeint
+#from scipy.integrate import odeint
+from scipy.integrate import solve_ivp
 from robotic_arm_new import RoboticArm
 
 
@@ -26,29 +27,41 @@ class RoboticArmDynamics(RoboticArm):
             num_joints: 机械臂关节数量 (默认为 6)
         """
         super().__init__(num_joints)
-        self.link_lengths = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        #self.link_lengths = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        self.link_lengths = []
+        for i in range(self.num_joints):
+            a = abs(self.dh_params[i, 2])   # a 参数
+            d = abs(self.dh_params[i, 1])   # d 参数
+            length = a if a > 1e-6 else (d if d > 1e-6 else 0.05)  # 都为0时给最小值
+            self.link_lengths.append(length)
         # 连杆质量
         self.link_masses = [2.0, 3.0, 2.5, 1.5, 1.0, 0.5]
         # 连杆质心位置 (相对于关节坐标系)
         self.link_coms = [
-            [0, -0.1, self.link_lengths[0]/2],  # Link 1
+            [0, 0, self.link_lengths[0]/2],  # Link 1
             [self.link_lengths[1]/2, 0, 0],  # Link 2
             [self.link_lengths[2]/2, 0, 0], # Link 3
             [0, 0, self.link_lengths[3]/2],  # Link 4
             [0, 0, 0], # Link 5
-            [0, 0, self.link_lengths[4]/2]  # Link 6
+            [0, 0, self.link_lengths[5]/2]  # Link 6
         ]
         #连杆惯性张量（简化为对角矩阵 ）
         self.link_inertias = []
         for i, (m, l) in enumerate(zip(self.link_masses, self.link_lengths)):
-            # 简化为细杆模型：I = (1/12) * m * L^2
-            I = (1/12) * m * l**2
-            self.link_inertias.append(np.diag([I, I, I]))
+            # 圆柱模型：考虑半径，半径假设为连杆长度的 1/10，最小 0.02m
+            r = max(l * 0.1, 0.02)
+            # 沿轴方向: (1/2)mr², 垂直方向: (1/12)m(3r² + L²)
+            I_axial   = 0.5 * m * r**2
+            I_radial  = (1/12) * m * (3*r**2 + l**2)
+            # 至少保证 0.01 kg·m²
+            I_axial  = max(I_axial,  0.01)
+            I_radial = max(I_radial, 0.01)
+            self.link_inertias.append(np.diag([I_radial, I_radial, I_axial]))
         # 重力加速度
         self.gravity = np.array([0, 0, -9.81])
 
         # 关节摩擦系数 
-        self.friction_coeffs = np.array([5.0, 5.0, 5.0, 2.0, 2.0, 2.0])
+        self.friction_coeffs = np.array([2.0, 5.0, 4.0, 1.0, 1.0, 0.5])
 
     def mass_matrix(self, q):
         """计算质量矩阵 M(q)
@@ -73,6 +86,10 @@ class RoboticArmDynamics(RoboticArm):
             # 矩阵乘法直接累加贡献： J_v.T * J_v 是 (6x3) @ (3x6) = (6x6) 的矩阵
             M += m_k * (J_vk.T @ J_vk) + (J_wk.T @ I_k @ J_wk)
 
+        # 给每个关节加一个最小转子惯量（模拟电机转子），防止 M 奇异
+        rotor_inertia = np.array([0.5, 0.5, 0.3, 0.1, 0.1, 0.05])
+        M += np.diag(rotor_inertia)        
+
         return M
     def coriolis_matrix(self, q, q_dot):
         """计算科氏力矩阵 C(q, q_dot)
@@ -82,8 +99,12 @@ class RoboticArmDynamics(RoboticArm):
         返回:
             C: 科氏力矩阵 (num_joints x num_joints)
         """
+        #如果当前各关节速度都极小，直接返回 0 矩阵
+        #if np.max(np.abs(q_dot)) < 0.05:
+        #    return np.zeros((self.num_joints, self.num_joints))
+        
         C = np.zeros((self.num_joints, self.num_joints))
-        epsilon = 1e-6
+        epsilon = 1e-3 #1e-6
 
         # 1. 预计算：将质量矩阵 M 对每个关节角度 q_k 的偏导数先算出来
         # dM_dq 会保存 6 个 6x6 的矩阵，避免在三层循环里重复计算 
@@ -115,6 +136,15 @@ class RoboticArmDynamics(RoboticArm):
 
         return C
         
+    def _get_link_com_position(self, q, link_idx):
+        """获取连杆质心在世界坐标系下的位置"""
+        transforms = self.get_all_joint_transforms(q)
+        T_i = transforms[link_idx]
+        R_i = T_i[0:3, 0:3]                          # 旋转矩阵
+        p_i = T_i[0:3, 3]                            # 关节原点位置
+        com_local = np.array(self.link_coms[link_idx])
+        return p_i + R_i @ com_local                 # 质心世界坐标
+    
     def gravity_vector(self, q):
         """计算重力向量 G(q)
         参数:
@@ -156,10 +186,17 @@ class RoboticArmDynamics(RoboticArm):
         # 考虑摩擦力矩
         friction = self.friction_coeffs * q_dot
 
-        # 计算加速度
-        q_ddot = np.linalg.pinv(M) @ (tau - C @ q_dot - G - friction)
+        rhs = tau - C @ q_dot - G - friction
 
-        return q_ddot
+        # 计算加速度
+            # 先检查条件数，防止奇异
+        cond = np.linalg.cond(M)
+        if cond > 1e8:
+            import warnings
+            warnings.warn(f"质量矩阵接近奇异，条件数={cond:.2e}，使用 pinv 兜底")
+            return np.linalg.pinv(M) @ rhs
+    
+        return np.linalg.solve(M, rhs)
     
     def inverse_dynamics(self, q, q_dot, q_ddot):
         """
@@ -186,7 +223,7 @@ class RoboticArmDynamics(RoboticArm):
 
         return tau
     
-    def simulate(self, q0, q_dot0, tau_func, t_span, dt=0.01):
+    def simulate(self, q0, q_dot0, tau_func, t_span, dt=0.01, use_fixed_step=False):
         """
         模拟机械臂运动
 
@@ -202,55 +239,122 @@ class RoboticArmDynamics(RoboticArm):
         # 计数器
         step_count = [0]
 
-        def dynamics(state, t):
+        def dynamics_fn(t, state):
             """状态方程"""
-            # 显示计算进度
-            step_count[0] += 1
-            if step_count[0] % 10 == 0:
-                print(f"动力学仿真计算中... 虚拟时间推进到了 t = {t:.3f} 秒")
             q = state[:self.num_joints]
             q_dot = state[self.num_joints:]
+            # 显示计算进度
+            step_count[0] += 1
+            if step_count[0] % 50 == 0:
+                print(f"动力学仿真计算中... 虚拟时间推进到了 t = {t:.3f} 秒")
 
             #计算力矩
-            tau = tau_func(q, q_dot, t)
+            tau = tau_func(q, q_dot, t).copy()
 
+
+            #软限位
+            k_spring = 10.0
+            k_damp   = 3.0
+            for i, (lo, hi) in enumerate(self.joint_limits):
+                if q[i] < lo:
+                    tau[i] += k_spring * (lo - q[i]) - k_damp * q_dot[i]
+                elif q[i] > hi:
+                    tau[i] += k_spring * (hi - q[i]) - k_damp * q_dot[i]
+    
             #计算加速度
             q_ddot = self.forward_dynamics(q, q_dot, tau)
-
             #返回状态导数
             return np.concatenate([q_dot, q_ddot])
         
         #初始状态
         state0 = np.concatenate([q0, q_dot0])
+            
+        if use_fixed_step:
+            # 半隐式 Euler（Symplectic Euler）：先更新速度，再用新速度更新位置
+            # 对机械系统比普通 Euler 稳定得多
+            t_arr = np.arange(t_span[0], t_span[1], dt)
+            n = self.num_joints
+            states = np.zeros((len(t_arr), len(state0)))
+            states[0] = state0
 
-        #时间点
-        t = np.arange(t_span[0], t_span[1], dt)
+            for idx in range(len(t_arr) - 1):
+                t_cur = t_arr[idx]
+                q     = states[idx, :n].copy()
+                q_dot = states[idx, n:].copy()
 
+                # 计算力矩
+                tau = tau_func(q, q_dot, t_cur).copy()
+
+                # 软限位
+                k_spring, k_damp = 10.0, 3.0
+                for i, (lo, hi) in enumerate(self.joint_limits):
+                    if q[i] < lo:
+                        tau[i] += k_spring * (lo - q[i]) - k_damp * q_dot[i]
+                    elif q[i] > hi:
+                        tau[i] += k_spring * (hi - q[i]) - k_damp * q_dot[i]
+
+                # 计算加速度
+                q_ddot = self.forward_dynamics(q, q_dot, tau)
+
+                # NaN 保护
+                if not np.all(np.isfinite(q_ddot)):
+                    print(f"警告：t={t_cur:.3f}s 时仿真发散，停止积分")
+                    states = states[:idx+1]
+                    t_arr = t_arr[:idx+1]
+                    break
+
+                # 半隐式 Euler：先更新速度，再用新速度更新位置
+                q_dot_new = q_dot + dt * q_ddot
+                q_new     = q     + dt * q_dot_new
+
+                # 更新进度
+                step_count[0] += 1
+                if step_count[0] % 50 == 0:
+                    print(f"动力学仿真计算中... 虚拟时间推进到了 t = {t_cur:.3f} 秒")
+
+                states[idx+1, :n] = q_new
+                states[idx+1, n:] = q_dot_new
+
+            q     = states[:, :n]
+            q_dot = states[:, n:]
+            return t_arr, q, q_dot
+        
+        else:
+            # Radau 用于计算力矩控制（无状态控制器）
+            t_eval = np.arange(t_span[0], t_span[1], dt)
+            result = solve_ivp(
+                dynamics_fn, t_span, state0,
+                method='Radau', t_eval=t_eval,
+                rtol=1e-3, atol=1e-5, max_step=dt
+            )
+            if not result.success:
+                print(f"警告：ODE求解未完全收敛：{result.message}")
+            return result.t, result.y[:self.num_joints].T, result.y[self.num_joints:].T
+
+    
         #数值积分
-        states = odeint(dynamics, state0, t, mxstep=5000)
+        #states = solve_ivp(dynamics, t_span, state0, t_eval=t_eval, method='RK45', max_step=dt)
 
-        q = states[:, :self.num_joints]
-        q_dot = states[:, self.num_joints:]
+        #q = states[:, :self.num_joints]
+        #q_dot = states[:, self.num_joints:]
 
-        return t, q, q_dot
+        #return t, q, q_dot
 
     def _velocity_jacobian(self, q, link_idx):
         """计算连杆速度雅可比矩阵"""
         #简化实现：使用数值微分
         J = np.zeros((3, self.num_joints))
-        epsilon = 1e-6
+        epsilon = 1e-4 #1e-6
 
         for i in range(self.num_joints):
-            q_plus = q.copy()
-            q_plus[i] += epsilon
-            pos_plus = self._get_link_position(q_plus, link_idx)
-
-            q_minus = q.copy()
-            q_minus[i] -= epsilon
-            pos_minus = self._get_link_position(q_minus, link_idx)
-
-            J[:, i] = (pos_plus - pos_minus) / (2 * epsilon)
+            q_plus = q.copy(); q_plus[i] += epsilon
+            q_minus = q.copy(); q_minus[i] -= epsilon
         
+            # ← 改为质心位置，不是关节原点
+            pos_plus  = self._get_link_com_position(q_plus,  link_idx)
+            pos_minus = self._get_link_com_position(q_minus, link_idx)
+        
+            J[:, i] = (pos_plus - pos_minus) / (2 * epsilon)
         return J
 
     def _angular_velocity_jacobian(self, q, link_idx):
@@ -258,6 +362,12 @@ class RoboticArmDynamics(RoboticArm):
         #简化实现
         J = np.zeros((3, self.num_joints))
         #实现角速度雅可比矩阵
+        
+        transforms = self.get_all_joint_transforms(q)
+    
+        for i in range(link_idx + 1):   # 只有 link_idx 之前的关节有贡献
+            T_i = transforms[i]
+            J[:, i] = T_i[0:3, 2]      # z 轴方向就是第3列的前3个元素
         return J
 
     def _com_jacobian(self, q, link_idx):
@@ -276,10 +386,68 @@ class RoboticArmDynamics(RoboticArm):
         # 变换矩阵的第 4 列的前 3 个元素，就是该连杆在世界坐标系下的位置 [x, y, z]
         return T_i[0:3, 3]
     
+    
+class JointKalmanFilter:
+    """
+    单关节卡尔曼滤波器
+    状态: x = [位置, 速度]
+    观测: z = [位置]（速度由滤波器估计出来）
+    
+    用途：传感器只能测位置，速度是估计出的，比直接数值微分更平滑、抗噪
+    """
+    def __init__(self, dt=0.01, process_noise=0.01, measurement_noise=0.05):
+        self.dt = dt
+        
+        # 状态转移矩阵 F (匀加速模型简化为匀速)
+        # x_new = F @ x_old
+        # [pos_new]   [1, dt] [pos_old]
+        # [vel_new] = [0, 1 ] [vel_old]
+        self.F = np.array([[1.0, dt ],
+                           [0.0, 1.0]])
+        
+        # 观测矩阵 H：只能测到位置
+        self.H = np.array([[1.0, 0.0]])
+        
+        # 过程噪声协方差 Q：模型不准确度
+        # 越大 → 越相信观测；越小 → 越相信模型预测
+        q = process_noise
+        self.Q = q * np.array([[dt**4/4, dt**3/2],
+                               [dt**3/2, dt**2  ]])
+        
+        # 观测噪声协方差 R：传感器噪声水平
+        self.R = np.array([[measurement_noise**2]])
+        
+        # 初始状态和协方差
+        self.x = np.zeros(2)         # [位置, 速度]
+        self.P = np.eye(2) * 1.0     # 初始不确定性
 
+    def update(self, q_measured):
+        """输入一次位置观测，返回 (滤波后的位置, 估计的速度)"""
+        # === 预测步 ===
+        x_pred = self.F @ self.x
+        P_pred = self.F @ self.P @ self.F.T + self.Q
+        
+        # === 更新步 ===
+        z = np.array([q_measured])
+        y = z - self.H @ x_pred                              # 残差
+        S = self.H @ P_pred @ self.H.T + self.R              # 残差协方差
+        K = P_pred @ self.H.T @ np.linalg.inv(S)             # 卡尔曼增益
+        
+        self.x = x_pred + (K @ y).flatten()
+        self.P = (np.eye(2) - K @ self.H) @ P_pred
+        
+        return self.x[0], self.x[1]   # 滤波后的位置和速度
+
+    def reset(self, q_init=0.0):
+        """重置滤波器"""
+        self.x = np.array([q_init, 0.0])
+        self.P = np.eye(2) * 1.0
 
 class PIDController:
-    def __init__(self, Kp, Ki, Kd, num_joints=6, integral_limit=30.0, error_threshold=0.1):
+    def __init__(self, Kp, Ki, Kd, num_joints=6, integral_limit=30.0, error_threshold=0.1, dt=0.01,
+                 use_kalman=False,                    
+                 process_noise=0.01,                  
+                 measurement_noise=0.05):
         """PID控制器初始化
         参数:
             Kp: 比例增益
@@ -294,13 +462,23 @@ class PIDController:
         
         self.integral_limit = integral_limit
         self.error_threshold = error_threshold
-
         # 积分项累计
         self.integral = np.zeros(num_joints)
         # 上一次误差
         self.prev_error = np.zeros(num_joints)
         # 时间步长
-        self.dt = 0.01
+        self.dt = dt
+
+        # 卡尔曼滤波器（每个关节独立）
+        self.use_kalman = use_kalman
+        if use_kalman:
+            self.kf_list = [
+                JointKalmanFilter(dt=dt,
+                                  process_noise=process_noise,
+                                  measurement_noise=measurement_noise)
+                for _ in range(num_joints)
+            ]
+
 
     def compute_control(self, q_desired, q_actual, q_dot_actual, q_dot_desired=None):
         """计算闭环控制力矩       
@@ -316,37 +494,41 @@ class PIDController:
         if q_dot_desired is None:
             q_dot_desired = np.zeros_like(q_actual)
 
-        # 1. 位置误差
-        error = q_desired - q_actual
+        # 卡尔曼滤波：用观测的 q 估计更平滑的 q 和 q_dot
+        if self.use_kalman:
+            q_filt = np.zeros_like(q_actual)
+            q_dot_filt = np.zeros_like(q_dot_actual)
+            for i, kf in enumerate(self.kf_list):
+                q_filt[i], q_dot_filt[i] = kf.update(q_actual[i])
+        else:
+            q_filt = q_actual
+            q_dot_filt = q_dot_actual
 
-        # 2. 积分计算 (积分分离逻辑)
+        # 用滤波后的值计算误差
+        error = q_desired - q_filt
+
         for i in range(len(error)):
             if abs(error[i]) < self.error_threshold:
                 self.integral[i] += error[i] * self.dt
-            else:
-                # 误差较大时，积分项保持不变（也可以选择清零 self.integral[i] = 0）
-                pass 
 
-        # 3. 积分限幅 (强行截断，防止无限膨胀)
         self.integral = np.clip(self.integral, -self.integral_limit, self.integral_limit)
 
-        # 4. 微分项（速度误差）
-        error_dot = q_dot_desired - q_dot_actual
+        error_dot = q_dot_desired - q_dot_filt   # ← 用滤波速度
 
-        # 5. PID控制律计算
         tau_feedback = (self.Kp * error + 
                         self.Ki * self.integral + 
                         self.Kd * error_dot)
         
         self.prev_error = error
-
         return tau_feedback
 
-    def reset(self):
-        """重置积分项和误差（在每次开启新的仿真或运动前调用）"""
+    def reset(self, q_init=None):
         self.integral = np.zeros_like(self.integral)
         self.prev_error = np.zeros_like(self.prev_error)
-
+        if self.use_kalman:
+            for i, kf in enumerate(self.kf_list):
+                init_val = q_init[i] if q_init is not None else 0.0
+                kf.reset(q_init=init_val)
     
 
 class ComputedTorqueController:
@@ -411,6 +593,67 @@ class GravityCompensationPIDController:
         
         return tau_total
 
+class CartesianImpedanceController:
+    """
+    笛卡尔空间阻抗控制器
+    
+    让末端在3D空间表现得像一个 弹簧-阻尼 系统：
+        F = K_p * (x_desired - x_actual) - K_d * x_dot_actual
+    然后通过雅可比转置 tau = J^T * F 转成关节力矩
+    
+    特点：
+    - 末端"软"地被拉向目标点，遇到外力会让步（适合接触任务）
+    - 不需要精确的逆运动学，直接在笛卡尔空间施力
+    - 配合重力补偿一起用，效果最佳
+    """
+    def __init__(self, robotic_dynamics, 
+                 K_p=None, K_d=None,
+                 use_gravity_comp=True):
+        """
+        参数:
+            robotic_dynamics: 动力学模型实例（用于算雅可比和重力）
+            K_p: 笛卡尔空间刚度矩阵 (3,)，单位 N/m，越大越"硬"
+            K_d: 笛卡尔空间阻尼矩阵 (3,)，单位 N·s/m
+            use_gravity_comp: 是否启用重力补偿
+        """
+        self.arm = robotic_dynamics
+        # 默认刚度：x/y/z 三个方向各 200 N/m（中等软度）
+        self.K_p = np.array(K_p) if K_p is not None else np.array([200.0, 200.0, 200.0])
+        # 默认阻尼：建议 K_d ≈ 2*sqrt(K_p)，临界阻尼避免振荡
+        self.K_d = np.array(K_d) if K_d is not None else np.array([28.0, 28.0, 28.0])
+        self.use_gravity_comp = use_gravity_comp
+
+    def compute_control(self, x_desired, q_actual, q_dot_actual):
+        """
+        参数:
+            x_desired: 末端期望位置 (3,) [x, y, z]
+            q_actual: 当前关节角度 (6,)
+            q_dot_actual: 当前关节速度 (6,)
+        返回:
+            tau: 关节力矩 (6,)
+        """
+        # 1. 计算末端当前位置（用父类的正向运动学）
+        T_end = self.arm.forward_kinematics(q_actual)
+        x_actual = T_end[0:3, 3]
+
+        # 2. 计算末端线速度雅可比 J (3x6)
+        J = self.arm.jacobian(q_actual)
+        
+        # 3. 末端当前速度 = J @ q_dot
+        x_dot_actual = J @ q_dot_actual
+
+        # 4. 笛卡尔空间的虚拟弹簧-阻尼力 F = K_p * Δx - K_d * v
+        F = self.K_p * (x_desired - x_actual) - self.K_d * x_dot_actual
+
+        # 5. 通过雅可比转置映射到关节力矩 tau = J^T * F
+        tau = J.T @ F
+
+        # 6. 加上重力补偿（不补偿的话机械臂会因重力下垂）
+        if self.use_gravity_comp:
+            tau += self.arm.gravity_vector(q_actual)
+
+        return tau
+    
 #测试代码
 def test_freefall():
     #创建动力学模型
@@ -427,11 +670,12 @@ def test_freefall():
     q0 = np.array([0, np.pi/4, 0, 0, 0, 0])
     q_dot0 = np.zeros(6)
 
-    def zero_torque(t, q, q_dot):
+    def zero_torque(q, q_dot, t):
         return np.zeros(6)
     
     t, q_hist, q_dot_hist = arm.simulate(
-        q0, q_dot0, zero_torque, [0, 2.0], dt=0.01
+        q0, q_dot0, zero_torque, [0, 1.0], dt=0.01, 
+        use_fixed_step=True
     )            
     print(f"仿真时间：{len(t)}个时间步")
     print(f"最终角度：{q_hist[-1]}")
@@ -441,34 +685,40 @@ def test_pid_controller():
     arm = RoboticArmDynamics(num_joints=6)
 
     # PID参数 
-    Kp = [150, 150, 150, 50, 50, 50]
-    Ki = [50, 50, 50, 20, 20, 20]    
-    Kd = [15, 15, 15, 5, 5, 5]
+    Kp = [1.0, 5.0, 4.0, 0.5, 0.5, 0.5]
+    Ki = [0.1, 0.5, 0.4, 0.05, 0.05, 0.05]    
+    Kd = [1.5, 3.0, 2.5, 0.3, 0.3, 0.3]
 
-    # 1. 初始化带有抗积分饱和的PID
-    pure_pid = PIDController(Kp, Ki, Kd, integral_limit=30.0, error_threshold=0.1)
+    # 启用卡尔曼滤波
+    pure_pid = PIDController(Kp, Ki, Kd, 
+                             integral_limit=30.0, error_threshold=0.1, dt=0.01,
+                             use_kalman=True,             # ← 开启
+                             process_noise=0.01,
+                             measurement_noise=0.02)
     
-    # 2. 将纯PID包装进重力补偿控制器中
     controller = GravityCompensationPIDController(arm, pure_pid)
 
-    # 目标位置
-    q_target = np.array([0.5, 0.5, -0.5, 0, 0.5, 0])
-
-    # 初始状态
-    q0 = np.array([0.1, 0.1, -0.1, 0.1, 0.1, 0.1])
+    q_target = np.array([0.0, 0.3, -0.3, 0.0, 0.2, 0.0])
+    q0 = np.array([0.0, 0.1, -0.1, 0.0, 0.1, 0.0])
     q_dot0 = np.zeros(6)
 
-    # 控制函数
-    def control_torque(q, q_dot, t):
-        # 使用组合控制器输出力矩
-        return controller.compute_control(q_target, q, q_dot)
-    
-    pure_pid.reset()
+    # 模拟带噪声的传感器读数
+    noise_std = 0.005   # 5毫弧度的位置噪声
+    rng = np.random.default_rng(seed=42)
 
-    # 仿真
-    print("重力补偿+PID闭环仿真计算中...")
+    # 定义控制函数，内部添加观测噪声
+    def control_torque(q, q_dot, t):
+        # 在真实 q 上加观测噪声
+        q_noisy = q + rng.normal(0, noise_std, size=q.shape)
+        q_dot_noisy = q_dot + rng.normal(0, noise_std*10, size=q_dot.shape)
+        return controller.compute_control(q_target, q_noisy, q_dot_noisy)
+    
+    pure_pid.reset(q_init=q0)   # 用 q0 初始化卡尔曼
+
+    print("重力补偿+PID(带卡尔曼滤波)闭环仿真计算中...")
     t, q_hist, q_dot_hist = arm.simulate(
-        q0, q_dot0, control_torque, [0, 2.0], dt=0.01
+        q0, q_dot0, control_torque, [0, 5.0], dt=0.01,
+        use_fixed_step=True
     )
 
     # 绘制结果
@@ -513,14 +763,15 @@ def compare_controllers():
     print("测试计算力矩控制器...")
     ct_controller = ComputedTorqueController(arm, Kp, Kd)
 
-    q0 = np.zeros(6)
-    q_dot0 = np.zeros(6)
+    #q0 = np.zeros(6)
+    #q_dot0 = np.zeros(6)
 
     def ct_control(q, q_dot, t):
         q_d, q_dot_d, q_ddot_d = trajectory(t)
         return ct_controller.compute_control(q_d, q_dot_d, q_ddot_d, q, q_dot)
     
     q0, _, _ = trajectory(0)
+    q_dot0 = np.zeros(6)
     t, q_ct, q_dot_ct = arm.simulate(q0, q_dot0, ct_control, [0, 1.0], dt=0.02)
 
     #计算跟踪误差
@@ -556,7 +807,94 @@ def compare_controllers():
     plt.tight_layout()
     plt.show()
 
+def test_impedance_controller():
+    """测试笛卡尔阻抗控制：末端被虚拟弹簧拉向目标，遇外力会让步"""
+    arm = RoboticArmDynamics(num_joints=6)
+    
+    # 阻抗参数：x/y/z 方向刚度
+    K_p = [300.0, 300.0, 300.0]   # N/m
+    K_d = [35.0,  35.0,  35.0]    # N·s/m，约 2*sqrt(K_p)
+    
+    controller = CartesianImpedanceController(arm, K_p=K_p, K_d=K_d)
+    
+    # 初始姿态（接近"home"位置但稍微弯曲）
+    q0 = np.array([0.0, 0.3, -0.5, 0.0, 0.3, 0.0])
+    q_dot0 = np.zeros(6)
+    
+    # 先算出初始末端位置
+    T0 = arm.forward_kinematics(q0)
+    x_start = T0[0:3, 3]
+    print(f"初始末端位置: {x_start.round(4)}")
+    
+    # 目标点：在初始位置 x 方向偏移 +10cm
+    x_target = x_start + np.array([0.10, 0.0, 0.0])
+    print(f"目标末端位置: {x_target.round(4)}")
+    
+    # 模拟一个外力扰动：t=2.5s 时在 z 方向施加 -20 N 持续 0.5 秒
+    def control_torque(q, q_dot, t):
+        tau = controller.compute_control(x_target, q, q_dot)
+        
+        # 外力扰动模拟（直接给关节力矩加一个干扰项）
+        if 2.5 <= t <= 3.0:
+            # 通过 J^T 把外力映射到关节空间
+            J = arm.jacobian(q)
+            F_ext = np.array([0.0, 0.0, -20.0])   # z 方向向下推 20N
+            tau += J.T @ F_ext
+        
+        return tau
+    
+    print("阻抗控制仿真计算中...")
+    t, q_hist, q_dot_hist = arm.simulate(
+        q0, q_dot0, control_torque, [0, 5.0], dt=0.01,
+        use_fixed_step=True
+    )
+    
+    # 计算每个时刻的末端位置轨迹
+    x_hist = np.zeros((len(t), 3))
+    for i in range(len(t)):
+        T = arm.forward_kinematics(q_hist[i])
+        x_hist[i] = T[0:3, 3]
+    
+    # 绘制结果
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8))
+    labels = ['X', 'Y', 'Z']
+    for i in range(3):
+        axes[i].plot(t, x_hist[:, i], label=f'Actual {labels[i]}')
+        axes[i].axhline(x_target[i], color='r', linestyle='--', label=f'Target {labels[i]}')
+        axes[i].axvspan(2.5, 3.0, alpha=0.2, color='orange', label='External force')
+        axes[i].set_xlabel('Time (s)')
+        axes[i].set_ylabel(f'{labels[i]} position (m)')
+        axes[i].set_title(f'End-Effector {labels[i]} Position')
+        axes[i].legend()
+        axes[i].grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # 最终位置
+    print(f"最终末端位置: {x_hist[-1].round(4)}")
+    print(f"位置误差: {np.linalg.norm(x_hist[-1] - x_target):.4f} m")
+
+
 if __name__ == "__main__":
+    # ===== 0. 验证质量矩阵健康度 =====
+    print("========== 验证质量矩阵 ==========")
+    arm = RoboticArmDynamics()
+    M = arm.mass_matrix(np.zeros(6))
+    print("质量矩阵对角线:", np.diag(M).round(4))
+    print("条件数:", np.linalg.cond(M))
+    print()
+    # ===== 1.单独验证重力补偿方向 =====
+    print("========== 验证重力向量符号 ==========")
+    arm_test = RoboticArmDynamics(num_joints=6)
+    q_test = np.array([0, np.pi/4, 0, 0, 0, 0])
+    G = arm_test.gravity_vector(q_test)
+    print(f"重力向量 G = {G.round(4)}")
+    print(f"Joint 2 (抬起 45°) 的重力矩 G[1] = {G[1]:.4f}")
+    print(f"期望：G[1] > 0（需要正力矩抵抗重力下压）")
+    print(f"结果：{'✓ 符号正确' if G[1] > 0 else '✗ 符号反了，需要取负'}")
+    print()
+
     print("========== 运行自由落体测试 ==========")
     test_freefall()
     
@@ -565,3 +903,6 @@ if __name__ == "__main__":
     
     print("\n========== 运行计算力矩控制器测试 ==========")
     compare_controllers()
+
+    print("\n========== 运行笛卡尔阻抗控制测试 ==========")
+    test_impedance_controller()

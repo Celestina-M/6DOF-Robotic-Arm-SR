@@ -26,7 +26,7 @@ class TrajectoryPlanner:
             position：关节位置
             velocity：关节速度
             acceleration：关节加速度
-        TODO: 实现三种插值方法：线性、三次样条、五次样条，并计算速度和加速度
+        实现三种插值方法：线性、三次样条、五次样条，并计算速度和加速度
         """
         start_angles = np.array(start_angles)
         end_angles = np.array(end_angles)
@@ -105,7 +105,7 @@ class TrajectoryPlanner:
 
     def _quintic_interpolation(self, start, end, duration, num_points):
         """五次多项式插值
-        TODO: 实现五次多项式插值，起点和终点的速度和加速度为零
+        实现五次多项式插值，起点和终点的速度和加速度为零
         q(t) = a0 + a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5
         """
         trajectory = []
@@ -173,7 +173,7 @@ class TrajectoryPlanner:
             position：末端位置 [x, y, z]
             velocity：末端速度 [vx, vy, vz]
             acceleration：末端加速度 [ax, ay, az]
-        TODO: 实现笛卡尔空间中的直线路径规划，计算末端位置、速度和加速度
+        实现笛卡尔空间中的直线路径规划，计算末端位置、速度和加速度
         步骤：
         1. 在笛卡尔空间中插值
         2.对每个点求解IK
@@ -184,6 +184,7 @@ class TrajectoryPlanner:
         end_pos = np.array(end_pos)
 
         trajectory = []
+        last_angles = None  # 记录上一个成功解，用于 IK 的初始猜测
 
         # 在笛卡尔空间中线性插值
         for i in range(num_points):
@@ -193,12 +194,16 @@ class TrajectoryPlanner:
             target_pos = (1 - t) * start_pos + t * end_pos
 
             #求解IK
-            success, angles = self.robotic_arm.inverse_kinematics(target_pos)
+            success, angles = self.robotic_arm.inverse_kinematics(
+            target_pos, initial_guess=last_angles)
+
+             #如果成功，更新 last_angles
 
             if not success:
                 print(f"警告: 第{i}个点IK求解失败")
                 continue
 
+            last_angles = angles
             trajectory.append({
                 'time': t,
                 'position': angles,
@@ -220,11 +225,12 @@ class TrajectoryPlanner:
             position：末端位置 [x, y, z]
             velocity：末端速度 [vx, vy, vz]
             acceleration：末端加速度 [ax, ay, az]
-        TODO: 实现笛卡尔空间中的圆形路径规划，计算末端位置、速度和加速度
+        实现笛卡尔空间中的圆形路径规划，计算末端位置、速度和加速度
         """
 
         center = np.array(center)
         trajectory = []
+        last_angles = None  # 记录上一个成功解，用于 IK 的初始猜测
 
         for i in range(num_points):
             angle = 2 * np.pi * i / num_points 
@@ -240,10 +246,10 @@ class TrajectoryPlanner:
                 raise ValueError("未知平面类型：请选择 'xy', 'yz' 或 'xz'")
 
             #求解IK
-            success, angles = self.robotic_arm.inverse_kinematics(target_pos)
+            success, angles = self.robotic_arm.inverse_kinematics(target_pos, initial_guess=last_angles)
 
             if success:
-
+                last_angles = angles
                 trajectory.append({
                     'time': angle,
                     'position': angles,
@@ -272,36 +278,38 @@ class TrajectoryPlanner:
             """规划笛卡尔空间中的 3D 螺旋路径"""
             center = np.array(center)
             trajectory = []
+            last_angles = None          # 记录上一个成功解
 
             for i in range(num_points):
                 t = i / (num_points - 1)
-                angle = t * turns * 2 * np.pi 
-                
+                angle = t * turns * 2 * np.pi
                 target_pos = center + np.array([
-                    radius * np.cos(angle), 
-                    radius * np.sin(angle), 
+                    radius * np.cos(angle),
+                    radius * np.sin(angle),
                     z_start + t * (z_end - z_start)
                 ])
-
-                success, angles = self.robotic_arm.inverse_kinematics(target_pos)
+                # 用上一个解作为初始猜测（关键）
+                success, angles = self.robotic_arm.inverse_kinematics(
+                    target_pos, initial_guess=last_angles, max_iterations=300
+                )
                 if success:
-                    trajectory.append({
-                        'time': t,
-                        'position': angles
-                    })
+                    last_angles = angles
+                    trajectory.append({'time': t, 'position': angles})
                 else:
                     print(f"警告: 螺旋线第{i}个点IK求解失败，位置: {target_pos}")
-                    
             return trajectory
+
 
     def plan_smooth_multisegment(self, cartesian_waypoints, total_duration, num_points=100):
             """多段轨迹平滑连接 (用于绘制五角星等)"""
             joint_waypoints = []
             valid_waypoints = []
+            last_angles = None
             
             for pos in cartesian_waypoints:
-                success, angles = self.robotic_arm.inverse_kinematics(pos)
+                success, angles = self.robotic_arm.inverse_kinematics(pos, initial_guess=last_angles, max_iterations=300)
                 if success:
+                    last_angles = angles
                     joint_waypoints.append(angles)
                     valid_waypoints.append(pos)
                 else:
@@ -351,7 +359,7 @@ def test_weekends():
 
     print("正在规划 3D 螺旋线 (可能需要几秒钟解算 IK)...")
     spiral_traj = planner.plan_cartesian_spiral(
-        center=[0.3, 0.0, 0.0], radius=0.1, z_start=0.1, z_end=0.4, turns=4, num_points=100
+        center=[0.3, 0.0, 0.0], radius=0.08, z_start=0.1, z_end=0.3, turns=4, num_points=100
     )
 
     spiral_x, spiral_y, spiral_z = [], [], []
